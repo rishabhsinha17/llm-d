@@ -113,3 +113,37 @@ endpoints — so the script talks to pod IPs (`ENGINE_PORT`, default `8200`).
 Prerequisites: the OffloadingConnector P2P tier on the pods,
 `PYTHONHASHSEED` pinned fleet-wide, and the same transport you will deploy
 on. Lengths must be multiples of the vLLM block size.
+
+## Deriving the prefill work-range boundary
+
+Remaining-work routing (`context-length-aware` with `reusableTokensProducerName`,
+see the [plugin README](https://github.com/llm-d/llm-d-router/blob/main/pkg/epp/framework/plugins/scheduling/scorer/contextlengthaware/README.md))
+splits the prefill pool into a short-work and a long-work class by the
+`llm-d.ai/prefill-work-range` label and routes a cached follow-up by the
+prefill work left after its pullable prefix. The boundary between the two
+classes follows from the two numbers above, so it needs no further measurement:
+a pull pays only above the pull-versus-recompute crossover, and a request is
+long work once one rank needs longer than the load gate's `maxTTFTPenaltyMs`
+to prefill it.
+
+[`derive_work_boundary.py`](derive_work_boundary.py) takes `peakPrefillThroughput`
+(from `calibrate.sh`) and either the saved output of
+`calibrate-min-cached-token-delta.sh` (it fits the pull floor and per-token
+cost from the `tokens recompute_ms pull_ms` rows) or an explicit pull model,
+and prints the anchors, the block-aligned boundary, and the labels and EPP
+parameters to paste:
+
+```bash
+guides/recipes/router/calibration/derive_work_boundary.py \
+  --peak-prefill-throughput 3585 --ttft-penalty-ms 3500 \
+  --block-size 64 --max-context 120000 \
+  --pull-ladder calibration-min-cached-token-delta.log
+```
+
+On the GLM-5.2-FP8 on H200 reference (3585 tokens/s per rank, pull floor
+1.25 s plus 134 us per token, 3500 ms budget) it derives an 8,640-token
+boundary. An empty band (crossover above the SLO-equivalent work) means pulls
+cannot pay within the budget: raise `--ttft-penalty-ms` or do not split the
+pool. With `minCachedTokenDelta` D above 1 the plugin routes a follow-up on
+`newTokens + D - 1`, so the printed short ceiling is the boundary plus D - 1.
+It derives only; it does not touch any config.
